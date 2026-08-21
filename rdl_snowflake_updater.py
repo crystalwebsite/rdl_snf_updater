@@ -40,24 +40,14 @@ COMMAND_TEXT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-# Power BI RDL CommandText commonly contains a JSON payload. Therefore M-code
-# string quotes inside MashupDocument appear as \"value\". The same matcher also
-# supports plain quotes and XML-escaped quotes for other RDL variants.
+# Matches the first two positional string parameters of:
+# Source = Snowflake.Databases("server", "warehouse", ...)
+# It also supports XML-escaped quotes (&quot;).
 SNOWFLAKE_SOURCE_RE = re.compile(
     r"(?P<head>\bSource\s*=\s*Snowflake\.Databases\s*\(\s*)"
-    r"(?P<q1>\\\"|&quot;|\")(?P<server>.*?)(?P=q1)"
+    r"(?P<q1>\"|&quot;)(?P<server>.*?)(?P=q1)"
     r"(?P<separator>\s*,\s*)"
-    r"(?P<q2>\\\"|&quot;|\")(?P<warehouse>.*?)(?P=q2)",
-    re.IGNORECASE | re.DOTALL,
-)
-
-# Matches the ConnectionOverrides JSON metadata shown by Power BI, e.g.:
-# "Path":"myprod.snowflakecomputing.com;MY_WAREHOUSE"
-# It supports both literal JSON quotes and XML-escaped &quot; forms.
-CONNECTION_OVERRIDE_PATH_RE = re.compile(
-    r"(?P<head>(?:\"|&quot;)Path(?:\"|&quot;)\s*:\s*(?P<q>\"|&quot;))"
-    r"(?P<server>.*?);(?P<warehouse>.*?)"
-    r"(?P=q)",
+    r"(?P<q2>\"|&quot;)(?P<warehouse>.*?)(?P=q2)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -66,16 +56,13 @@ AUDIT_HEADERS = [
     "Timestamp",
     "File Name",
     "Dataset Name",
-    "Modification Type",
     "Status",
     "Before Server",
     "After Server",
     "Before Warehouse",
     "After Warehouse",
-    "Before Value",
-    "After Value",
-    "Before Code Snapshot",
-    "After Code Snapshot",
+    "Before Source Code",
+    "After Source Code",
     "Input Path",
     "Output Path",
     "Original SHA256",
@@ -88,16 +75,13 @@ class AuditRow:
     timestamp: str
     file_name: str
     dataset_name: str
-    modification_type: str
     status: str
     before_server: str = ""
     after_server: str = ""
     before_warehouse: str = ""
     after_warehouse: str = ""
-    before_value: str = ""
-    after_value: str = ""
-    before_code_snapshot: str = ""
-    after_code_snapshot: str = ""
+    before_source_code: str = ""
+    after_source_code: str = ""
     input_path: str = ""
     output_path: str = ""
     original_sha256: str = ""
@@ -108,16 +92,13 @@ class AuditRow:
             self.timestamp,
             self.file_name,
             self.dataset_name,
-            self.modification_type,
             self.status,
             self.before_server,
             self.after_server,
             self.before_warehouse,
             self.after_warehouse,
-            self.before_value,
-            self.after_value,
-            self.before_code_snapshot,
-            self.after_code_snapshot,
+            self.before_source_code,
+            self.after_source_code,
             self.input_path,
             self.output_path,
             self.original_sha256,
@@ -126,57 +107,11 @@ class AuditRow:
 
 
 @dataclass
-class SourceChange:
-    before_server: str
-    after_server: str
-    before_warehouse: str
-    after_warehouse: str
-    before_code: str
-    after_code: str
-
-    @property
-    def changed(self) -> bool:
-        return (
-            self.before_server != self.after_server
-            or self.before_warehouse != self.after_warehouse
-        )
-
-
-@dataclass
-class PathChange:
-    before_server: str
-    after_server: str
-    before_warehouse: str
-    after_warehouse: str
-    before_code: str
-    after_code: str
-
-    @property
-    def changed(self) -> bool:
-        return (
-            self.before_server != self.after_server
-            or self.before_warehouse != self.after_warehouse
-        )
-
-
-@dataclass
-class ModifyResult:
-    text: str
-    audit_rows: list[AuditRow]
-    source_match_count: int
-    source_change_count: int
-    path_match_count: int
-    path_change_count: int
-
-
-@dataclass
 class FileProcessResult:
     input_file: Path
     output_file: Path | None
     dataset_names: list[str]
-    source_match_count: int
-    source_change_count: int
-    path_change_count: int
+    changed_count: int
     deleted_original: bool
 
 
@@ -207,125 +142,70 @@ def local_name(tag: str) -> str:
 
 
 def validate_and_list_datasets(xml_text: str) -> list[str]:
-    """Validate XML and return DataSet/@Name values located under DataSets."""
+    """Validate XML and return every DataSet/@Name in document order."""
     root = ET.fromstring(xml_text)
     names: list[str] = []
-
-    for data_sets in root.iter():
-        if local_name(data_sets.tag).lower() != "datasets":
-            continue
-        for child in list(data_sets):
-            if local_name(child.tag).lower() != "dataset":
-                continue
-            name = child.attrib.get("Name") or child.attrib.get("name")
+    for element in root.iter():
+        if local_name(element.tag).lower() == "dataset":
+            name = element.attrib.get("Name") or element.attrib.get("name")
             if name:
                 names.append(name)
-
     return names
 
 
 def xml_escape_text_value(value: str) -> str:
-    """Escape characters that are unsafe inside XML element text."""
+    """Escape only characters that are unsafe in XML element text."""
     return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def validate_target_value(value: str, label: str) -> None:
-    """Reject characters that would break the serialized JSON/M string structure."""
-    if any(ch in value for ch in ('"', "\r", "\n")):
-        raise ValueError(f"{label} cannot contain a double quote or newline.")
 
 
 # -----------------------------------------------------------------------------
 # RDL modification
 # -----------------------------------------------------------------------------
-def replace_snowflake_sources(
+def replace_snowflake_source(
     command_text: str,
     new_server: str,
     new_warehouse: str,
-) -> tuple[str, list[SourceChange]]:
-    """Replace the first two positional parameters of Snowflake.Databases(...)."""
-    changes: list[SourceChange] = []
+) -> tuple[str, list[tuple[str, str, str, str, str, str]]]:
+    """
+    Replace Source = Snowflake.Databases(server, warehouse, ...).
+
+    Returns:
+        modified_command_text,
+        list of tuples:
+          before_server, after_server, before_warehouse, after_warehouse,
+          before_source_code, after_source_code
+    """
+    changes: list[tuple[str, str, str, str, str, str]] = []
 
     def replacement(match: re.Match[str]) -> str:
         before_server = match.group("server")
         before_warehouse = match.group("warehouse")
 
-        # CommandText is still raw XML text, so target values must remain XML-safe.
-        server_for_xml = xml_escape_text_value(new_server)
-        warehouse_for_xml = xml_escape_text_value(new_warehouse)
+        # In raw XML text, element content still needs XML escaping.
+        server = xml_escape_text_value(new_server)
+        warehouse = xml_escape_text_value(new_warehouse)
 
         after = (
             f'{match.group("head")}'
-            f'{match.group("q1")}{server_for_xml}{match.group("q1")}'
+            f'{match.group("q1")}{server}{match.group("q1")}'
             f'{match.group("separator")}'
-            f'{match.group("q2")}{warehouse_for_xml}{match.group("q2")}'
+            f'{match.group("q2")}{warehouse}{match.group("q2")}'
         )
 
         changes.append(
-            SourceChange(
-                before_server=before_server,
-                after_server=new_server,
-                before_warehouse=before_warehouse,
-                after_warehouse=new_warehouse,
-                before_code=match.group(0),
-                after_code=after,
+            (
+                before_server,
+                new_server,
+                before_warehouse,
+                new_warehouse,
+                match.group(0),
+                after,
             )
         )
         return after
 
-    return SNOWFLAKE_SOURCE_RE.sub(replacement, command_text), changes
-
-
-def replace_connection_override_paths(
-    command_text: str,
-    source_changes: list[SourceChange],
-    new_server: str,
-    new_warehouse: str,
-) -> tuple[str, list[PathChange]]:
-    """
-    Keep ConnectionOverrides[].Path synchronized with the Snowflake source.
-
-    Only paths whose server/warehouse pair matches a Snowflake.Databases pair
-    found in the same CommandText are updated. This avoids changing unrelated
-    connection metadata.
-    """
-    source_pairs = {
-        (change.before_server, change.before_warehouse)
-        for change in source_changes
-    }
-    changes: list[PathChange] = []
-
-    if not source_pairs:
-        return command_text, changes
-
-    def replacement(match: re.Match[str]) -> str:
-        before_server = match.group("server")
-        before_warehouse = match.group("warehouse")
-
-        if (before_server, before_warehouse) not in source_pairs:
-            return match.group(0)
-
-        server_for_xml = xml_escape_text_value(new_server)
-        warehouse_for_xml = xml_escape_text_value(new_warehouse)
-        after = (
-            f'{match.group("head")}'
-            f'{server_for_xml};{warehouse_for_xml}'
-            f'{match.group("q")}'
-        )
-
-        changes.append(
-            PathChange(
-                before_server=before_server,
-                after_server=new_server,
-                before_warehouse=before_warehouse,
-                after_warehouse=new_warehouse,
-                before_code=match.group(0),
-                after_code=after,
-            )
-        )
-        return after
-
-    return CONNECTION_OVERRIDE_PATH_RE.sub(replacement, command_text), changes
+    modified = SNOWFLAKE_SOURCE_RE.sub(replacement, command_text)
+    return modified, changes
 
 
 def modify_rdl_text(
@@ -334,13 +214,10 @@ def modify_rdl_text(
     new_warehouse: str,
     input_file: Path,
     output_file: Path,
-) -> ModifyResult:
-    """Modify Snowflake connection values dataset-by-dataset without XML reserialization."""
+) -> tuple[str, list[AuditRow], int]:
+    """Modify Snowflake Source expressions dataset-by-dataset without reserializing XML."""
     audit_rows: list[AuditRow] = []
-    source_match_count = 0
-    source_change_count = 0
-    path_match_count = 0
-    path_change_count = 0
+    total_changes = 0
     now = datetime.now().astimezone().isoformat(timespec="seconds")
 
     parts: list[str] = []
@@ -353,89 +230,45 @@ def modify_rdl_text(
         name_match = DATASET_NAME_RE.search(attrs)
         dataset_name = name_match.group("name") if name_match else "<unnamed>"
 
-        dataset_source_changes: list[SourceChange] = []
-        dataset_path_changes: list[PathChange] = []
+        dataset_changes: list[tuple[str, str, str, str, str, str]] = []
 
         def command_replacement(command_match: re.Match[str]) -> str:
+            nonlocal dataset_changes
             command_text = command_match.group("cmd")
-
-            modified_cmd, source_changes = replace_snowflake_sources(
+            modified_cmd, changes = replace_snowflake_source(
                 command_text, new_server, new_warehouse
             )
-            final_cmd, path_changes = replace_connection_override_paths(
-                modified_cmd,
-                source_changes,
-                new_server,
-                new_warehouse,
-            )
-
-            dataset_source_changes.extend(source_changes)
-            dataset_path_changes.extend(path_changes)
-            return f'{command_match.group("open")}{final_cmd}{command_match.group("close")}'
+            dataset_changes.extend(changes)
+            return f'{command_match.group("open")}{modified_cmd}{command_match.group("close")}'
 
         modified_block = COMMAND_TEXT_RE.sub(command_replacement, dataset_block)
         parts.append(modified_block)
         cursor = dataset_match.end()
 
-        if dataset_source_changes:
-            source_match_count += len(dataset_source_changes)
-            source_change_count += sum(change.changed for change in dataset_source_changes)
-            path_match_count += len(dataset_path_changes)
-            path_change_count += sum(change.changed for change in dataset_path_changes)
-
-            for index, change in enumerate(dataset_source_changes, start=1):
-                status = "MODIFIED" if change.changed else "NO_CHANGE_REQUIRED"
+        if dataset_changes:
+            total_changes += len(dataset_changes)
+            for change_index, change in enumerate(dataset_changes, start=1):
+                (
+                    before_server,
+                    after_server,
+                    before_warehouse,
+                    after_warehouse,
+                    before_code,
+                    after_code,
+                ) = change
+                status = "MODIFIED" if len(dataset_changes) == 1 else f"MODIFIED #{change_index}"
                 audit_rows.append(
                     AuditRow(
                         timestamp=now,
                         file_name=input_file.name,
                         dataset_name=dataset_name,
-                        modification_type=(
-                            "Snowflake.Databases Source"
-                            if len(dataset_source_changes) == 1
-                            else f"Snowflake.Databases Source #{index}"
-                        ),
                         status=status,
-                        before_server=change.before_server,
-                        after_server=change.after_server,
-                        before_warehouse=change.before_warehouse,
-                        after_warehouse=change.after_warehouse,
-                        before_value=(
-                            f"Server={change.before_server}; "
-                            f"Warehouse={change.before_warehouse}"
-                        ),
-                        after_value=(
-                            f"Server={change.after_server}; "
-                            f"Warehouse={change.after_warehouse}"
-                        ),
-                        before_code_snapshot=change.before_code,
-                        after_code_snapshot=change.after_code,
-                        input_path=str(input_file.resolve()),
-                        output_path=str(output_file.resolve()),
-                    )
-                )
-
-            for index, change in enumerate(dataset_path_changes, start=1):
-                status = "MODIFIED" if change.changed else "NO_CHANGE_REQUIRED"
-                audit_rows.append(
-                    AuditRow(
-                        timestamp=now,
-                        file_name=input_file.name,
-                        dataset_name=dataset_name,
-                        modification_type=(
-                            "ConnectionOverrides.Path"
-                            if len(dataset_path_changes) == 1
-                            else f"ConnectionOverrides.Path #{index}"
-                        ),
-                        status=status,
-                        before_server=change.before_server,
-                        after_server=change.after_server,
-                        before_warehouse=change.before_warehouse,
-                        after_warehouse=change.after_warehouse,
-                        before_value=f"{change.before_server};{change.before_warehouse}",
-                        after_value=f"{change.after_server};{change.after_warehouse}",
-                        before_code_snapshot=change.before_code,
-                        after_code_snapshot=change.after_code,
+                        before_server=before_server,
+                        after_server=after_server,
+                        before_warehouse=before_warehouse,
+                        after_warehouse=after_warehouse,
+                        before_source_code=before_code,
+                        after_source_code=after_code,
                         input_path=str(input_file.resolve()),
                         output_path=str(output_file.resolve()),
                     )
@@ -446,7 +279,6 @@ def modify_rdl_text(
                     timestamp=now,
                     file_name=input_file.name,
                     dataset_name=dataset_name,
-                    modification_type="Snowflake.Databases Source",
                     status="NO_SNOWFLAKE_SOURCE_MATCH",
                     input_path=str(input_file.resolve()),
                     output_path=str(output_file.resolve()),
@@ -454,14 +286,7 @@ def modify_rdl_text(
             )
 
     parts.append(xml_text[cursor:])
-    return ModifyResult(
-        text="".join(parts),
-        audit_rows=audit_rows,
-        source_match_count=source_match_count,
-        source_change_count=source_change_count,
-        path_match_count=path_match_count,
-        path_change_count=path_change_count,
-    )
+    return "".join(parts), audit_rows, total_changes
 
 
 # -----------------------------------------------------------------------------
@@ -483,22 +308,9 @@ def save_audit_rows_atomic(log_path: Path, rows: Iterable[AuditRow]) -> None:
 
     if log_path.exists():
         workbook = load_workbook(log_path)
-        sheet = (
-            workbook["ModificationLog"]
-            if "ModificationLog" in workbook.sheetnames
-            else workbook.create_sheet("ModificationLog")
-        )
-
-        existing_headers = [sheet.cell(1, col).value for col in range(1, len(AUDIT_HEADERS) + 1)]
+        sheet = workbook["ModificationLog"] if "ModificationLog" in workbook.sheetnames else workbook.create_sheet("ModificationLog")
         if sheet.max_row == 1 and sheet.cell(1, 1).value is None:
-            sheet.delete_rows(1, 1)
             sheet.append(AUDIT_HEADERS)
-        elif existing_headers != AUDIT_HEADERS:
-            workbook.close()
-            raise ValueError(
-                "The existing audit workbook uses an older/different column layout. "
-                "Rename or remove it once so the updater can create the current audit schema."
-            )
     else:
         workbook = Workbook()
         sheet = workbook.active
@@ -508,34 +320,22 @@ def save_audit_rows_atomic(log_path: Path, rows: Iterable[AuditRow]) -> None:
     for row in rows:
         sheet.append([excel_safe(v) for v in row.as_list()])
 
+    # Professional/basic audit formatting.
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
     for cell in sheet[1]:
         cell.fill = header_fill
         cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
 
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
 
     widths = {
-        1: 24,   # Timestamp
-        2: 30,   # File Name
-        3: 30,   # Dataset Name
-        4: 34,   # Modification Type
-        5: 24,   # Status
-        6: 36,   # Before Server
-        7: 36,   # After Server
-        8: 24,   # Before Warehouse
-        9: 24,   # After Warehouse
-        10: 52,  # Before Value
-        11: 52,  # After Value
-        12: 70,  # Before Code
-        13: 70,  # After Code
-        14: 45,  # Input Path
-        15: 45,  # Output Path
-        16: 66,  # Original SHA256
-        17: 66,  # Modified SHA256
+        1: 24, 2: 30, 3: 30, 4: 26,
+        5: 34, 6: 34, 7: 24, 8: 24,
+        9: 55, 10: 55, 11: 45, 12: 45,
+        13: 66, 14: 66,
     }
     for col_idx, width in widths.items():
         sheet.column_dimensions[get_column_letter(col_idx)].width = width
@@ -544,6 +344,7 @@ def save_audit_rows_atomic(log_path: Path, rows: Iterable[AuditRow]) -> None:
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
 
+    # Atomic save: write a complete temporary XLSX first, then replace.
     fd, temp_name = tempfile.mkstemp(
         prefix=log_path.stem + "_",
         suffix=".xlsx",
@@ -613,7 +414,7 @@ def process_rdl_file(
     else:
         print("  (none)")
 
-    result = modify_rdl_text(
+    modified_text, audit_rows, changed_count = modify_rdl_text(
         xml_text=xml_text,
         new_server=new_server,
         new_warehouse=new_warehouse,
@@ -621,54 +422,50 @@ def process_rdl_file(
         output_file=output_file,
     )
 
-    # No Snowflake.Databases source exists anywhere in this RDL.
-    if result.source_match_count == 0:
-        for row in result.audit_rows:
+    # If there is no valid target, keep the original in place.
+    if changed_count == 0:
+        for row in audit_rows:
             row.original_sha256 = original_hash
-        save_audit_rows_atomic(log_path, result.audit_rows)
-        print("  No matching Snowflake.Databases(server, warehouse, ...) source was found.")
+        save_audit_rows_atomic(log_path, audit_rows)
+        print("  No matching Source = Snowflake.Databases(server, warehouse, ...) was found.")
         print("  Original file was NOT deleted.")
         return FileProcessResult(
             input_file=input_file,
             output_file=None,
             dataset_names=dataset_names,
-            source_match_count=0,
-            source_change_count=0,
-            path_change_count=0,
+            changed_count=0,
             deleted_original=False,
         )
 
-    modified_bytes = encode_xml_text(result.text, encoding, bom)
+    modified_bytes = encode_xml_text(modified_text, encoding, bom)
     modified_hash = sha256_bytes(modified_bytes)
 
-    # Validate the transformed RDL before permanent file operations.
-    validate_and_list_datasets(result.text)
+    # Validate the modified XML before writing anything permanent.
+    validate_and_list_datasets(modified_text)
 
-    for row in result.audit_rows:
+    for row in audit_rows:
         row.original_sha256 = original_hash
         row.modified_sha256 = modified_hash
 
     output_written = False
     try:
-        # 1. Write modified/pass-through RDL atomically.
+        # 1. Write modified RDL atomically.
         write_atomic(output_file, modified_bytes, overwrite=overwrite)
         output_written = True
 
         # 2. Write audit log atomically.
-        save_audit_rows_atomic(log_path, result.audit_rows)
+        save_audit_rows_atomic(log_path, audit_rows)
 
-        # 3. Remove original only after both writes succeeded.
+        # 3. Only after both succeed, remove the original.
         input_file.unlink()
     except Exception:
-        # Keep the source file safe. Roll back an output created by this failed run.
+        # Keep source file safe. If this run created an output but did not finish,
+        # remove the incomplete transaction's output.
         if output_written and output_file.exists():
             output_file.unlink(missing_ok=True)
         raise
 
-    print(f"  Snowflake.Databases source(s) found: {result.source_match_count}")
-    print(f"  Source value change(s): {result.source_change_count}")
-    print(f"  ConnectionOverrides.Path match(es): {result.path_match_count}")
-    print(f"  ConnectionOverrides.Path change(s): {result.path_change_count}")
+    print(f"  Modified Snowflake Source occurrence(s): {changed_count}")
     print(f"  Output: {output_file}")
     print(f"  Audit log: {log_path}")
     print("  Original input file deleted after successful output + audit save.")
@@ -677,9 +474,7 @@ def process_rdl_file(
         input_file=input_file,
         output_file=output_file,
         dataset_names=dataset_names,
-        source_match_count=result.source_match_count,
-        source_change_count=result.source_change_count,
-        path_change_count=result.path_change_count,
+        changed_count=changed_count,
         deleted_original=True,
     )
 
@@ -697,9 +492,8 @@ def load_config(path: Path) -> dict:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Update Snowflake.Databases server/warehouse values in Power BI RDL files, "
-            "synchronize matching ConnectionOverrides.Path metadata, write modified files "
-            "to an output folder, and maintain an Excel audit log."
+            "Update Source = Snowflake.Databases(server, warehouse, ...) in Power BI RDL files, "
+            "write modified files to an output folder, and maintain an Excel audit log."
         )
     )
     parser.add_argument("--config", default="config.json", help="Path to JSON configuration file.")
@@ -724,20 +518,11 @@ def main() -> int:
     overwrite = bool(args.overwrite or config.get("overwrite", False))
 
     if not server:
-        print(
-            "ERROR: Snowflake server is required. Set snowflake_server in config.json or use --server.",
-            file=sys.stderr,
-        )
+        print("ERROR: Snowflake server is required. Set snowflake_server in config.json or use --server.", file=sys.stderr)
         return 2
     if not warehouse:
-        print(
-            "ERROR: Snowflake warehouse is required. Set snowflake_warehouse in config.json or use --warehouse.",
-            file=sys.stderr,
-        )
+        print("ERROR: Snowflake warehouse is required. Set snowflake_warehouse in config.json or use --warehouse.", file=sys.stderr)
         return 2
-
-    validate_target_value(server, "Snowflake server")
-    validate_target_value(warehouse, "Snowflake warehouse")
 
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
