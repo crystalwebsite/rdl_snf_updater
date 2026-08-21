@@ -1,0 +1,8 @@
+{
+  "input_dir": "input",
+  "output_dir": "output",
+  "audit_file": "logs/rdl_modification_log.xlsx",
+  "snowflake_server": "your_target.snowflakecomputing.com",
+  "snowflake_warehouse": "YOUR_TARGET_WAREHOUSE",
+  "overwrite": false
+}
